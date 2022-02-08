@@ -27,7 +27,11 @@ class TestThreadQueue < Test::Unit::TestCase
     grind(5, 1000, 15, SizedQueue, 1000)
   end
 
-  def grind(num_threads, num_objects, num_iterations, klass, *args)
+  def test_unbuffered_queue
+    grind(5, 1000, 15, SizedQueue, 0, batch: false)
+  end
+
+  def grind(num_threads, num_objects, num_iterations, klass, *args, batch: true)
     from_workers = klass.new(*args)
     to_workers = klass.new(*args)
 
@@ -40,10 +44,20 @@ class TestThreadQueue < Test::Unit::TestCase
     }
 
     Thread.new {
-      num_iterations.times {
-        num_objects.times { to_workers.push 99 }
-        num_objects.times { from_workers.pop }
-      }
+      if batch
+        # can only batch if num_objects <= q.max
+        num_iterations.times {
+          num_objects.times { to_workers.push 99 }
+          num_objects.times { from_workers.pop }
+        }
+      else
+        num_iterations.times {
+          num_objects.times {|i|
+            to_workers.push i
+            from_workers.pop
+          }
+        }
+      end
     }.join
 
     # close the queue the old way to test for backwards-compatibility
@@ -79,7 +93,8 @@ class TestThreadQueue < Test::Unit::TestCase
   def test_sized_queue_initialize
     q = Thread::SizedQueue.new(1)
     assert_equal 1, q.max
-    assert_raise(ArgumentError) { Thread::SizedQueue.new(0) }
+    q = Thread::SizedQueue.new(0) # synchronous (rendezvous) channel
+    assert_equal 0, q.max
     assert_raise(ArgumentError) { Thread::SizedQueue.new(-1) }
   end
 
@@ -88,8 +103,9 @@ class TestThreadQueue < Test::Unit::TestCase
     assert_equal(2, q.max)
     q.max = 1
     assert_equal(1, q.max)
-    assert_raise(ArgumentError) { q.max = 0 }
-    assert_equal(1, q.max)
+    q.max = 0 # synchronous (rendezvous) channel
+    assert_equal(0, q.max)
+    q.max = 1
     assert_raise(ArgumentError) { q.max = -1 }
     assert_equal(1, q.max)
 
@@ -187,6 +203,10 @@ class TestThreadQueue < Test::Unit::TestCase
   end
 
   def test_sized_queue_push_interrupt
+    q = Thread::SizedQueue.new(0)
+    assert_raise_with_message(ThreadError, /full/) do
+      q.push(1, true)
+    end
     q = Thread::SizedQueue.new(1)
     q.push(1)
     assert_raise_with_message(ThreadError, /full/) do
@@ -405,6 +425,10 @@ class TestThreadQueue < Test::Unit::TestCase
     close_wakeup(5, 8){Thread::SizedQueue.new 9}
   end
 
+  def test_unbuffered_queue_close_wakeup
+    close_wakeup(5, 8){Thread::SizedQueue.new 0}
+  end
+
   def test_sized_queue_one_closed_interrupt
     q = Thread::SizedQueue.new 1
     q << :one
@@ -564,11 +588,13 @@ class TestThreadQueue < Test::Unit::TestCase
   end
 
   # test thread wakeup on one-element SizedQueue with close
-  def test_one_element_sized_queue
-    q = Thread::SizedQueue.new 1
-    t = Thread.new{ q.pop }
-    q.close
-    assert_nil t.value
+  def test_wakeup_sized_queue_pop_with_close
+    [0, 1].each do |n|
+      q = Thread::SizedQueue.new n
+      t = Thread.new{ q.pop }
+      q.close
+      assert_nil t.value
+    end
   end
 
   def test_close_twice

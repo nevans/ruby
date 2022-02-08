@@ -31,11 +31,21 @@ describe :sizedqueue_max=, shared: true do
     -> { q.max = Object.new }.should raise_error(TypeError)
   end
 
-  it "raises an argument error when set to zero" do
-    q = @object.call(5)
-    q.max.should == 5
-    -> { q.max = 0 }.should raise_error(ArgumentError)
-    q.max.should == 5
+  ruby_version_is ""..."3.2" do
+    it "raises an argument error when set to zero" do
+      q = @object.call(5)
+      q.max.should == 5
+      -> { q.max = 0 }.should raise_error(ArgumentError)
+      q.max.should == 5
+    end
+  end
+  ruby_version_is "3.2" do
+    it "can be set to zero" do
+      q = @object.call(5)
+      q.max.should == 5
+      q.max = 0
+      q.max.should == 0
+    end
   end
 
   it "raises an argument error when set to a negative number" do
