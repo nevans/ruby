@@ -8,8 +8,10 @@ describe :sizedqueue_new, shared: true do
     -> { @object.call }.should raise_error(ArgumentError)
   end
 
-  it "raises an argument error when the given argument is zero" do
-    -> { @object.call(0) }.should raise_error(ArgumentError)
+  ruby_version_is ""..."3.2" do
+    it "raises an argument error when the given argument is zero" do
+      -> { @object.call(0) }.should raise_error(ArgumentError)
+    end
   end
 
   it "raises an argument error when the given argument is negative" do

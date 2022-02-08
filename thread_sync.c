@@ -45,6 +45,9 @@ sync_wakeup(struct list_head *head, long max)
 
             if (--max == 0) return;
         }
+        else {
+            // TODO: do we need to decrement num_waiting here?
+        }
     }
 }
 
@@ -770,6 +773,17 @@ check_array(VALUE obj, VALUE ary)
     return ary;
 }
 
+/* when deqs are waiting, queue *must* be empty */
+/* when enqs are waiting, queue *must* be full */
+#define szqueue_waiting_deq_p(sq) (0 < (sq)->q.num_waiting)
+#define szqueue_waiting_enq_p(sq) (0 < (sq)->num_waiting_push)
+
+#define queue_empty_p(self, q) (0 == queue_length(self, (q)))
+#define szqueue_full_p(self, sq) ((sq)->max <= queue_length(self, &(sq)->q))
+
+/* rendezvous: always empty and always full, simultaneously */
+#define szqueue_rendezvous_p(sq)  ((sq)->max == 0)
+
 static long
 queue_length(VALUE self, struct rb_queue *q)
 {
@@ -800,7 +814,7 @@ raise_closed_queue_error(VALUE self)
 static VALUE
 queue_closed_result(VALUE self, struct rb_queue *q)
 {
-    assert(queue_length(self, q) == 0);
+    assert(queue_empty_p(self, q));
     return Qnil;
 }
 
@@ -980,12 +994,38 @@ struct queue_waiter {
 	struct rb_queue *q;
 	struct rb_szqueue *sq;
     } as;
+    VALUE data;   // The object being enqueued or dequeued.
+    bool success; // true if data was transferred to or from this waiter.
 };
+
+/*
+ * Returns a result to the queue waiter and wakes it up.
+ */
+static inline void
+queue_waiter_wakeup_success(struct queue_waiter *qw, VALUE data)
+{
+    qw->data    = data;
+    qw->success = true;
+
+    struct sync_waiter *w = &qw->w;
+    if (w->th->scheduler != Qnil && rb_fiberptr_blocking(w->fiber) == 0) {
+        rb_fiber_scheduler_unblock(w->th->scheduler, w->self, rb_fiberptr_self(w->fiber));
+    }
+    else {
+        rb_threadptr_interrupt(w->th);
+        w->th->status = THREAD_RUNNABLE;
+    }
+}
 
 static VALUE
 queue_sleep_done(VALUE p)
 {
     struct queue_waiter *qw = (struct queue_waiter *)p;
+
+    if (LIKELY(qw->success)) {
+        // when successful, the waiter has already been removed
+        return Qtrue;
+    }
 
     list_del(&qw->w.node);
     qw->as.q->num_waiting--;
@@ -997,6 +1037,10 @@ static VALUE
 szqueue_sleep_done(VALUE p)
 {
     struct queue_waiter *qw = (struct queue_waiter *)p;
+    if (LIKELY(qw->success)) {
+        // when successful, the waiter has already been removed
+        return Qtrue;
+    }
 
     list_del(&qw->w.node);
     qw->as.sq->num_waiting_push--;
@@ -1075,13 +1119,34 @@ rb_queue_pop(int argc, VALUE *argv, VALUE self)
  * Document-method: Thread::Queue#empty?
  * call-seq: empty?
  *
- * Returns +true+ if the queue is empty.
+ * Returns +true+ if the queue is empty and dequeuing would block or fail.
+ *
+ * Please note: queue state can change before the caller can use the result.
  */
 
 static VALUE
 rb_queue_empty_p(VALUE self)
 {
-    return RBOOL(queue_length(self, queue_ptr(self)) == 0);
+    return RBOOL(queue_empty_p(self, queue_ptr(self)));
+}
+
+
+/*
+ * Document-method: Thread::Queue#full?
+ * call-seq: full?
+ *
+ * Instances of Queue have unlimited size and return +false+ until closed.
+ * Closed queues always return +true+.
+ *
+ * Subclasses return +true+ when full and enqueuing would block or fail.
+ *
+ * Please note: queue state can change before the caller can use the result.
+ */
+
+static VALUE
+rb_queue_full_p(VALUE self)
+{
+    return rb_queue_closed_p(self);
 }
 
 /*
@@ -1106,6 +1171,10 @@ rb_queue_clear(VALUE self)
  *   size
  *
  * Returns the length of the queue.
+ *
+ * Please note: +size+ only measures the queue's internal buffer.
+ *
+ * See #num_waiting for the number of waiting receivers or senders.
  */
 
 static VALUE
@@ -1134,7 +1203,127 @@ rb_queue_num_waiting(VALUE self)
  * This class represents queues of specified size capacity.  The push operation
  * may be blocked if the capacity is full.
  *
- * See Thread::Queue for an example of how a Thread::SizedQueue works.
+ * SizedQueue should be preferred over Queue for many scenarios.  It can help
+ * avoid out-of-memory errors and it applies backpressure to producers which run
+ * faster than their consumers.
+ *
+ * A SizedQueue's capacity can also be zero, which creates an unbuffered queue,
+ * also known as a "rendezvous channel" or a "synchronous channel".  Unbuffered
+ * queues require both sender and receiver meet at the same time (the
+ * "rendezvous").  Senders always block until they are matched with a receiver,
+ * and receivers always block until matched with a sender.  Senders and
+ * receivers are still handled in the same FIFO order as any other Queue.
+ *
+ * An unbuffered queue used to signal the end of a long-running task:
+ *
+ *   # assuming a fiber scheduler has been set:
+ *   task = Thread::SizedQueue.new 0
+ *   Fiber.schedule do
+ *     result = long_long_task 1, 2, 3
+ *     task << {value: result}
+ *   rescue => ex
+ *     task << {error: ex}
+ *   ensure
+ *     task.close
+ *   end
+ *
+ *   # similar to Thread#join
+ *   case task.pop
+ *   in value:
+ *     value
+ *   in error:
+ *     raise error
+ *   else
+ *     raise "task closed without returning!"
+ *   end
+ *
+ * An unbuffered queue used for a simple timer:
+ *
+ *   # ticks once per second, and keeps ticking if a receiver isn't listening
+ *   def naive_ticker(interval)
+ *     ticker = Thread::SizedQueue.new 0
+ *     Thread.new do
+ *       loop do # loop catches ClosedQueueError
+ *         ticker.push(Time.now, true)
+ *       rescue ThreadError
+ *         # no receiver; skip this tick
+ *       ensure
+ *         sleep interval
+ *       end
+ *     end
+ *     def ticker.tick; pop   end
+ *     def ticker.stop; close end
+ *     ticker
+ *   end
+ *
+ *   ticker = naive_ticker 0.300
+ *   stop_at  = Time.now + 3  # => 16:18:21.182
+ *   sleep_at = Time.now + 1  # => 16:18:19.182
+ *   while time = ticker.tick
+ *     puts time.strftime("%T.%L")
+ *     if sleep_at <= time && time <= sleep_at + 0.75
+ *       print "snore... "
+ *       sleep 0.75
+ *       puts "wakeup at #{Time.now.strftime('%T.%L')}"
+ *     end
+ *     ticker.stop if stop_at <= time
+ *   end
+ *
+ *   # >> 16:18:18.182
+ *   # >> 16:18:18.483
+ *   # >> 16:18:18.783
+ *   # >> 16:18:19.084
+ *   # >> 16:18:19.384
+ *   # >> snore... wakeup at 16:18:20.135
+ *   # >> 16:18:20.285
+ *   # >> 16:18:20.586
+ *   # >> 16:18:20.886
+ *   # >> 16:18:21.187
+ *
+ * A SizeQueue can be used like a semaphore, to limit concurrent processes
+ * working on a task or with a resource.  Similarly the buffer size could be
+ * used to represent burst-size in a rate-limiter:
+ *
+ *   # allows a burst of activity, then backs off to only allow one per interval
+ *   def naive_bursty_rate_limiter(interval, burst)
+ *     limiter = Thread::SizedQueue.new burst
+ *     burst.times { limiter << Time.now }
+ *     Thread.new do
+ *       loop do
+ *         limiter.push Time.now # blocks
+ *       ensure
+ *         sleep interval
+ *       end
+ *     end
+ *     def limiter.call; yield pop end
+ *     def limiter.stop; close     end
+ *     limiter
+ *   end
+ *
+ *   limiter = naive_bursty_rate_limiter(0.2, 5)
+ *   job = proc do puts Time.now.strftime("%T.%L") end
+ *   puts "five fast, then two slow:"
+ *   7.times { limiter.call(&job) }
+ *   sleep 0.6 # enough time to build back *three* burst, but not all five
+ *   puts "three fast, then two slow:"
+ *   5.times { limiter.call(&job) }
+ *
+ *   # >> five fast, then two slow:
+ *   # >> 16:33:53.639
+ *   # >> 16:33:53.639
+ *   # >> 16:33:53.639
+ *   # >> 16:33:53.639
+ *   # >> 16:33:53.639
+ *   # >> 16:33:53.639
+ *   # >> 16:33:53.840
+ *   # >> three fast, then two slow:
+ *   # >> 16:33:54.441
+ *   # >> 16:33:54.441
+ *   # >> 16:33:54.441
+ *   # >> 16:33:54.641
+ *   # >> 16:33:54.841
+ *
+ * See Thread::Queue for other examples of how a Thread::SizedQueue can be used.
  */
 
 /*
@@ -1151,8 +1340,8 @@ rb_szqueue_initialize(VALUE self, VALUE vmax)
     struct rb_szqueue *sq = szqueue_ptr(self);
 
     max = NUM2LONG(vmax);
-    if (max <= 0) {
-	rb_raise(rb_eArgError, "queue size must be positive");
+    if (max < 0) {
+        rb_raise(rb_eArgError, "queue size must not be negative");
     }
 
     RB_OBJ_WRITE(self, &sq->q.que, ary_buf_new());
@@ -1214,8 +1403,8 @@ rb_szqueue_max_set(VALUE self, VALUE vmax)
     long diff = 0;
     struct rb_szqueue *sq = szqueue_ptr(self);
 
-    if (max <= 0) {
-	rb_raise(rb_eArgError, "queue size must be positive");
+    if (max < 0) {
+        rb_raise(rb_eArgError, "queue size must not be negative");
     }
     if (max > sq->max) {
 	diff = max - sq->max;
@@ -1236,6 +1425,67 @@ szqueue_push_should_block(int argc, const VALUE *argv)
     return should_block;
 }
 
+static VALUE
+szqueue_do_push(VALUE self, VALUE object, int should_block)
+{
+    struct rb_szqueue *sq   = szqueue_ptr(self);
+    VALUE buffer            = check_array(self, sq->q.que);
+    struct list_head *waitq = queue_waitq(&sq->q);
+    struct queue_waiter *rcvr;
+
+    do {
+        // The queue is closed.  Nothing can be sent.  Raise an exception.
+        if (UNLIKELY(queue_closed_p(self))) {
+            raise_closed_queue_error(self);
+            UNREACHABLE_RETURN(Qnil);
+        }
+
+        // waiting receivers must be dealt with.  assume queue must be empty.
+        while ((rcvr = list_pop(waitq, struct queue_waiter, w.node))) {
+            sq->q.num_waiting--;
+            // Make sure it's still alive
+            if (LIKELY(rcvr->w.th->status != THREAD_KILLED)) {
+                // Copy directly to rcvr's stack and inform them it's ready
+                queue_waiter_wakeup_success(rcvr, object);
+                return self;
+            }
+        }
+
+        // space in the buffer and no receivers are waiting.  push it.
+        if (RARRAY_LEN(buffer) < sq->max) {
+            rb_ary_push(buffer, object);
+            return self;
+        }
+
+        // shouldn't block and nothing to do now.  raise an exception.
+        if (!should_block) {
+            rb_raise(rb_eThreadError, "queue full");
+            UNREACHABLE_RETURN(Qnil);
+        }
+
+        // Block this fiber until success or the queue has been closed.
+        else {
+            rb_execution_context_t *ec = GET_EC();
+            struct queue_waiter queue_waiter = {
+                .w = {.self = self, .th = ec->thread_ptr, .fiber = ec->fiber_ptr},
+                .data = object,
+                .as = {.sq = sq}
+            };
+
+            struct list_head *pushq = szqueue_pushq(sq);
+
+            list_add_tail(pushq, &queue_waiter.w.node);
+            sq->num_waiting_push++;
+            rb_ensure(queue_sleep, self, szqueue_sleep_done, (VALUE)&queue_waiter);
+
+            if (queue_waiter.success) return self;
+        }
+
+        // Rudely awoken without sending data.  Loop and try again.
+    } while (true);
+    UNREACHABLE_RETURN(Qnil);
+}
+
 /*
  * Document-method: Thread::SizedQueue#push
  * call-seq:
@@ -1253,50 +1503,75 @@ szqueue_push_should_block(int argc, const VALUE *argv)
 static VALUE
 rb_szqueue_push(int argc, VALUE *argv, VALUE self)
 {
-    struct rb_szqueue *sq = szqueue_ptr(self);
     int should_block = szqueue_push_should_block(argc, argv);
+    return szqueue_do_push(self, argv[0], should_block);
+}
 
-    while (queue_length(self, &sq->q) >= sq->max) {
+static VALUE
+szqueue_do_pop(VALUE self, int should_block)
+{
+    struct rb_szqueue *sq   = szqueue_ptr(self);
+    VALUE buffer            = check_array(self, sq->q.que);
+    struct list_head *pushq = szqueue_pushq(sq);
+    struct queue_waiter *sndr;
+
+    do {
+
+        // Waiting senders need to be dealt with.  Assume buffer is full.
+        // Copy data directly from sender's stack: either as our result or
+        // appended to the buffer.
+        if ((sndr = list_pop(pushq, struct queue_waiter, w.node))) {
+            sq->num_waiting_push--;
+            // Make sure it's still alive
+            if (LIKELY(sndr->w.th->status != THREAD_KILLED)) {
+                VALUE result;
+                if (RARRAY_LEN(buffer)) {
+                    // Not empty: pop our result from head and push data to tail
+                    result = rb_ary_shift(buffer);
+                    rb_ary_push(buffer, sndr->data);
+                } else {
+                    // unbuffered channel; rendezvous with sender
+                    result = sndr->data;
+                }
+                // Inform the sender that their wait is over.
+                queue_waiter_wakeup_success(sndr, Qnil);
+                return result;
+            }
+        }
+
+        // buffer isn't empty and no senders are waiting.  pop from buffer.
+        if (RARRAY_LEN(buffer)) {
+            return rb_ary_shift(buffer);
+        }
+
+        // shouldn't block and nothing to do now.  raise an exception.
         if (!should_block) {
-            rb_raise(rb_eThreadError, "queue full");
+            rb_raise(rb_eThreadError, "queue empty");
+            UNREACHABLE_RETURN(Qnil);
         }
-        else if (queue_closed_p(self)) {
-            break;
+
+        // closed (and empty and allowed to block)
+        if (queue_closed_p(self)) {
+            return Qnil;
         }
+
+        // nothing to do. wait for sender to push data.
         else {
             rb_execution_context_t *ec = GET_EC();
             struct queue_waiter queue_waiter = {
                 .w = {.self = self, .th = ec->thread_ptr, .fiber = ec->fiber_ptr},
                 .as = {.sq = sq}
             };
+            list_add_tail(szqueue_waitq(sq), &queue_waiter.w.node);
+            sq->q.num_waiting++;
+            rb_ensure(queue_sleep, self, queue_sleep_done, (VALUE)&queue_waiter);
 
-            struct list_head *pushq = szqueue_pushq(sq);
-
-            list_add_tail(pushq, &queue_waiter.w.node);
-            sq->num_waiting_push++;
-
-            rb_ensure(queue_sleep, self, szqueue_sleep_done, (VALUE)&queue_waiter);
+            if (queue_waiter.success) return queue_waiter.data;
         }
-    }
 
-    if (queue_closed_p(self)) {
-        raise_closed_queue_error(self);
-    }
-
-    return queue_do_push(self, &sq->q, argv[0]);
-}
-
-static VALUE
-szqueue_do_pop(VALUE self, int should_block)
-{
-    struct rb_szqueue *sq = szqueue_ptr(self);
-    VALUE retval = queue_do_pop(self, &sq->q, should_block);
-
-    if (queue_length(self, &sq->q) < sq->max) {
-	wakeup_one(szqueue_pushq(sq));
-    }
-
-    return retval;
+        // Rudely awoken before we could receive an item. Loop and try again.
+    } while (true);
+    UNREACHABLE_RETURN(Qnil);
 }
 
 /*
@@ -1371,17 +1646,43 @@ rb_szqueue_num_waiting(VALUE self)
  * Document-method: Thread::SizedQueue#empty?
  * call-seq: empty?
  *
- * Returns +true+ if the queue is empty.
+ * Returns +true+ if the queue is empty and dequeing would block or fail.
+ *
+ * Unbuffered queues (when +max+ is zero) return +true+ when no senders are
+ * waiting, and +false+ when senders are waiting.  Unbuffered queues can be
+ * simultaneously +empty?+ and +full?+.
+ *
+ * Please note: queue state can change before the caller can use the result.
  */
 
 static VALUE
 rb_szqueue_empty_p(VALUE self)
 {
     struct rb_szqueue *sq = szqueue_ptr(self);
-
-    return RBOOL(queue_length(self, &sq->q) == 0);
+    return RBOOL(queue_empty_p(self, &sq->q) && list_empty(szqueue_pushq(sq)));
 }
 
+/*
+ * Document-method: Thread::SizedQueue#full?
+ * call-seq: full?
+ *
+ * Returns +true+ if the queue is full and enqueing would block or fail.
+ * Closed queues always return +true+.
+ *
+ * Unbuffered queues (when +max+ is zero) return +true+ when no receivers are
+ * waiting, and +false+ when receivers are waiting.  Unbuffered queues can be
+ * simultaneously +empty?+ and +full?+.
+ *
+ * Please note: queue state can change before the caller can use the result.
+ */
+
+static VALUE
+rb_szqueue_full_p(VALUE self)
+{
+    struct rb_szqueue *sq = szqueue_ptr(self);
+    return RBOOL(queue_closed_p(self) ||
+            (szqueue_full_p(self, sq) && list_empty(queue_waitq(&sq->q))));
+}
 
 /* ConditionalVariable */
 struct rb_condvar {
@@ -1603,6 +1904,7 @@ Init_thread_sync(void)
     rb_define_method(rb_cQueue, "push", rb_queue_push, 1);
     rb_define_method(rb_cQueue, "pop", rb_queue_pop, -1);
     rb_define_method(rb_cQueue, "empty?", rb_queue_empty_p, 0);
+    rb_define_method(rb_cQueue, "full?", rb_queue_full_p, 0);
     rb_define_method(rb_cQueue, "clear", rb_queue_clear, 0);
     rb_define_method(rb_cQueue, "length", rb_queue_length, 0);
     rb_define_method(rb_cQueue, "num_waiting", rb_queue_num_waiting, 0);
@@ -1623,6 +1925,7 @@ Init_thread_sync(void)
     rb_define_method(rb_cSizedQueue, "push", rb_szqueue_push, -1);
     rb_define_method(rb_cSizedQueue, "pop", rb_szqueue_pop, -1);
     rb_define_method(rb_cSizedQueue, "empty?", rb_szqueue_empty_p, 0);
+    rb_define_method(rb_cSizedQueue, "full?", rb_szqueue_full_p, 0);
     rb_define_method(rb_cSizedQueue, "clear", rb_szqueue_clear, 0);
     rb_define_method(rb_cSizedQueue, "length", rb_szqueue_length, 0);
     rb_define_method(rb_cSizedQueue, "num_waiting", rb_szqueue_num_waiting, 0);
