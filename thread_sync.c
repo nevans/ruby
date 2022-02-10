@@ -1,3 +1,7 @@
+#ifdef THREAD_SYNC_LOAD_HACKY_HEADER /* defined manually in compile_commands.json */
+#include "thread_sync.h"
+#endif
+
 /* included by thread.c */
 #include "ccan/list/list.h"
 
