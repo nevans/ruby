@@ -1,0 +1,123 @@
+---
+prelude: |
+  require 'thread'
+  max = 100 # for SizedQueues
+
+benchmark:
+  - name: vm_thread_queue
+    script: |
+      n = 10_000_000
+      q = Thread::Queue.new
+      consumer = Thread.new{
+        while q.pop
+          # consuming
+        end
+      }
+
+      producer = Thread.new{
+        n.times{
+          q.push true
+        }
+        q.push nil
+      }
+
+      consumer.join
+
+  - name: vm_thread_sized_queue
+    script: |
+      # on producer, one consumer
+
+      n = 1_000_000
+      q = Thread::SizedQueue.new(max)
+      consumer = Thread.new{
+        while q.pop
+          # consuming
+        end
+      }
+
+      producer = Thread.new{
+        while n > 0
+          q.push true
+          n -= 1
+        end
+        q.push nil
+      }
+
+      consumer.join
+
+  - name: vm_thread_sized_queue2
+    script: |
+      # one producer, many consumers
+      n = 1_000_000
+      m = 10
+      q = Thread::SizedQueue.new(max)
+      consumers = m.times.map do
+        Thread.new do
+          while q.pop
+            # consuming
+          end
+        end
+      end
+
+      producer = Thread.new do
+        while n > 0
+          q.push true
+          n -= 1
+        end
+        m.times { q.push nil }
+      end
+
+      producer.join
+      consumers.each(&:join)
+
+  - name: vm_thread_sized_queue3
+    script: |
+      # many producers, one consumer
+      n = 1_000_000
+      m = 10
+      q = Thread::SizedQueue.new(max)
+      consumer = Thread.new do
+        while q.pop
+          # consuming
+        end
+      end
+
+      producers = m.times.map do
+        Thread.new do
+          while n > 0
+            q.push true
+            n -= 1
+          end
+        end
+      end
+      producers.each(&:join)
+      q.push nil
+      consumer.join
+
+  - name: vm_thread_sized_queue4
+    script: |
+      # many producers, many consumers
+      nr = 1_000_000
+      n = 10
+      m = 10
+      q = Thread::SizedQueue.new(max)
+      consumers = n.times.map do
+        Thread.new do
+          while q.pop
+            # consuming
+          end
+        end
+      end
+
+      producers = m.times.map do
+        Thread.new do
+          while nr > 0
+            q.push true
+            nr -= 1
+          end
+        end
+      end
+
+      producers.each(&:join)
+      n.times { q.push nil }
+      consumers.each(&:join)

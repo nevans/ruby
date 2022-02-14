@@ -1,0 +1,169 @@
+---
+prelude: |
+  max = 100 # for SizedQueues
+  require "bundler/inline"
+
+  gemfile do
+    source "https://rubygems.org"
+    gem "async", "~> 2.0.0"
+  end
+
+benchmark:
+  - name: fiber_sched_async_gem_queue
+    script: |
+      n = 1_000_000
+      q = Thread::Queue.new
+      done = Thread::Queue.new
+      Async do
+        consumer = Async{
+          while q.pop
+            # consuming
+          end
+          done.close
+        }
+
+        producer = Async{
+          n.times{
+            q.push true
+          }
+          q.push nil
+        }
+
+        Async{done.pop}  # redundant with consumer.wait  :)
+        consumer.wait
+      end
+
+  - name: fiber_sched_async_gem_sized_queue
+    script: |
+      # on producer, one consumer
+
+      n = 1_000_000
+      q = Thread::SizedQueue.new(max)
+      done = Thread::Queue.new
+      Async do
+        consumer = Async{
+          while q.pop
+            # consuming
+          end
+          done.close
+        }
+
+        producer = Async{
+          while n > 0
+          q.push true
+          n -= 1
+          end
+          q.push nil
+        }
+
+        Async{done.pop}   # consumer.join (not necessary for this)
+        consumer.wait     # all fibers done (could replace done.pop)
+      end
+
+  - name: fiber_sched_async_gem_sized_queue2
+    script: |
+      # one producer, many consumers
+      n = 1_000_000
+      m = 10
+      q = Thread::SizedQueue.new(max)
+      cdone = Thread::Queue.new
+      pdone = Thread::Queue.new
+      Async do
+        consumers = m.times.map do
+          Async do
+            while q.pop
+              # consuming
+            end
+          end
+          cdone << true
+        end
+
+        pdone = Thread::Queue.new
+        producer = Async do
+          while n > 0
+            q.push true
+            n -= 1
+          end
+          m.times { q.push nil }
+          pdone.close
+        end
+
+        # this isn't necessary: scheduler.run completes all fibers
+        Async do
+          pdone.pop                  # producer.join
+          m.times do cdone.pop end   # consumers.each(&:join)
+        end
+      end
+
+  - name: fiber_sched_async_gem_sized_queue3
+    script: |
+      # many producers, one consumer
+      n = 1_000_000
+      m = 10
+      q = Thread::SizedQueue.new(max)
+      cdone = Thread::Queue.new
+      pdone = Thread::Queue.new
+
+      Async do
+        consumer = Async do
+          while q.pop
+            # consuming
+          end
+          cdone.close
+        end
+
+        producers = m.times.map do
+          Async do
+            while n > 0
+              q.push true
+              n -= 1
+            end
+            pdone << true
+          end
+        end
+
+        # this *is* necessary for the consumers to complete
+        Async do
+          m.times do pdone.pop end   # producers.each(&:join)
+          q.push nil
+          cdone.pop                  # consumer.join
+        end
+      end
+
+  - name: fiber_sched_async_gem_sized_queue4
+    script: |
+      # many producers, many consumers
+      nr = 1_000_000
+      n = 10
+      m = 10
+      q = Thread::SizedQueue.new(max)
+      cdone = Thread::Queue.new
+      pdone = Thread::Queue.new
+
+      Async do
+        consumers = n.times.map do
+          Async do
+            while q.pop
+              # consuming
+            end
+            cdone << true
+          end
+        end
+
+        producers = m.times.map do
+          Async do
+            while nr > 0
+              q.push true
+              nr -= 1
+            end
+            pdone << true
+          end
+        end
+
+        # this *is* necessary for the consumers to complete
+        Async do
+          m.times do pdone.pop end   # producers.each(&:join)
+          n.times { q.push nil }
+          n.times do cdone.pop end   # consumers.each(&:join)
+        end
+      end
